@@ -17,6 +17,7 @@
    limitations under the License.
 
 """
+import pandas as pd
 import pytest
 
 from eemeter.caltrack.design_matrices import (
@@ -416,3 +417,33 @@ def test_create_caltrack_billing_design_matrix_partial_empty_temp(
         meter_data[:10], temperature_data
     )
     assert "n_days_kept" in design_matrix.columns
+
+
+def test_create_caltrack_billing_design_matrix_with_temp_meter_diff_tz(
+    il_electricity_cdd_hdd_billing_monthly
+):
+    meter_data = il_electricity_cdd_hdd_billing_monthly["meter_data"].tz_convert(
+        "America/New_York"
+    )
+    temperature_data = il_electricity_cdd_hdd_billing_monthly["temperature_data"]
+    design_matrix = create_caltrack_billing_design_matrix(
+        meter_data[:15], temperature_data
+    )
+    temperature_data = temperature_data.tz_convert("America/New_York")
+    design_matrix_post = create_caltrack_billing_design_matrix(
+        meter_data[:15], temperature_data
+    )
+    pd.testing.assert_frame_equal(design_matrix, design_matrix_post)
+
+
+def test_create_caltrack_billing_design_matrix_with_25_hours(
+    il_electricity_cdd_hdd_billing_monthly
+):
+    meter_data = il_electricity_cdd_hdd_billing_monthly["meter_data"].tz_convert(
+        "America/New_York"
+    ).resample('M').mean()
+    temperature_data = il_electricity_cdd_hdd_billing_monthly["temperature_data"]
+    design_matrix = create_caltrack_billing_design_matrix(
+        meter_data[:15], temperature_data
+    )
+    assert design_matrix.n_days_dropped.sum() == 0

@@ -413,6 +413,9 @@ def compute_temperature_features(
     if meter_data_index.duplicated().any():
         raise ValueError("Duplicates found in input meter trace index.")
 
+    if meter_data_index.tz != temperature_data.index.tz:
+        temperature_data = temperature_data.tz_convert(meter_data_index.tz)
+
     temp_agg_funcs = []
     temp_agg_column_renames = {}
 
