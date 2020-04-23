@@ -18,6 +18,7 @@
 
 """
 import numpy as np
+import pandas as pd
 import statsmodels.formula.api as smf
 
 from ..features import (
@@ -26,6 +27,7 @@ from ..features import (
     compute_occupancy_feature,
     merge_features,
 )
+from ..metrics import ModelMetrics
 from ..segmentation import CalTRACKSegmentModel, SegmentedModel, fit_model_segments
 from ..warnings import EEMeterWarning
 
@@ -117,6 +119,13 @@ class CalTRACKHourlyModelResults(object):
         def _json_or_none(obj):
             return None if obj is None else obj.json()
 
+        def _json_or_none_in_dict(obj):
+            return (
+                None
+                if obj is None
+                else {key: _json_or_none(val) for key, val in obj.items()}
+            )
+
         data = {
             "status": self.status,
             "method_name": self.method_name,
@@ -124,10 +133,42 @@ class CalTRACKHourlyModelResults(object):
             "warnings": [w.json() for w in self.warnings],
             "metadata": self.metadata,
             "settings": self.settings,
-            "totals_metrics": _json_or_none(self.totals_metrics),
-            "avgs_metrics": _json_or_none(self.avgs_metrics),
+            "totals_metrics": _json_or_none_in_dict(self.totals_metrics),
+            "avgs_metrics": _json_or_none_in_dict(self.avgs_metrics),
         }
         return data
+
+    @classmethod
+    def from_json(cls, data):
+        """ Loads a JSON-serializable representation into the model state.
+
+        The input of this function is a dict which can be the result
+        of :any:`json.loads`.
+        """
+
+        # "model" is a CalTRACKHourlyModel that was serialized
+        model = None
+        d = data.get('model')
+        if d:
+            model = CalTRACKHourlyModel.from_json(d)
+
+        c = cls(
+            data.get('status'),
+            data.get('method_name'),
+            model=model,
+            warnings=data.get('warnings'),
+            metadata=data.get('metadata'),
+            settings=data.get('settings'))
+
+        # Note the metrics do not contain all the data needed
+        # for reconstruction (like the input pandas) ...
+        d = data.get('avgs_metrics')
+        if d:
+            c.avgs_metrics = ModelMetrics.from_json(d)
+        d = data.get('totals_metrics')
+        if d:
+            c.totals_metrics = ModelMetrics.from_json(d)
+        return c
 
     def predict(self, prediction_index, temperature_data, **kwargs):
         """ Predict over a particular index using temperature data.
@@ -221,6 +262,29 @@ class CalTRACKHourlyModel(SegmentedModel):
             }
         )
         return data
+
+    @classmethod
+    def from_json(cls, data):
+        """ Loads a JSON-serializable representation into the model state.
+
+        The input of this function is a dict which can be the result
+        of :any:`json.loads`.
+        """
+
+        segment_models = [
+            CalTRACKSegmentModel.from_json(s)
+            for s in data.get('segment_models')
+        ]
+
+        occupancy_lookup = pd.read_json(data.get('occupancy_lookup'), orient='split')
+        occupancy_lookup.index = occupancy_lookup.index.astype('category')
+
+        c = cls(segment_models,
+                occupancy_lookup,
+                pd.read_json(data.get('temperature_bins'), orient="split")
+                )
+
+        return c
 
 
 def caltrack_hourly_fit_feature_processor(
@@ -418,6 +482,26 @@ def fit_caltrack_hourly_model_segment(segment_name, segment_data):
     segment_model : :any:`CalTRACKSegmentModel`
         A model that represents the fitted model.
     """
+
+    def _get_hourly_model_formula(data):
+        if (np.sum(data.loc[data.weight > 0].occupancy) == 0) or (
+            np.sum(data.loc[data.weight > 0].occupancy)
+            == len(data.loc[data.weight > 0].occupancy)
+        ):
+            bin_occupancy_interactions = "".join(
+                [" + {}".format(c) for c in data.columns if "bin" in c]
+            )
+            return "meter_value ~ C(hour_of_week) - 1{}".format(
+                bin_occupancy_interactions
+            )
+        else:
+            bin_occupancy_interactions = "".join(
+                [" + {}:C(occupancy)".format(c) for c in data.columns if "bin" in c]
+            )
+            return "meter_value ~ C(hour_of_week) - 1{}".format(
+                bin_occupancy_interactions
+            )
+
     warnings = []
     if segment_data.dropna().empty:
         model = None
@@ -436,24 +520,27 @@ def fit_caltrack_hourly_model_segment(segment_name, segment_data):
 
     else:
 
-        def _get_hourly_model_formula(data):
-            return "meter_value ~ C(hour_of_week) - 1{}".format(
-                "".join(
-                    [" + {}".format(c) for c in data.columns if c.startswith("bin")]
-                )
-            )
-
         formula = _get_hourly_model_formula(segment_data)
         model = smf.wls(formula=formula, data=segment_data, weights=segment_data.weight)
         model_params = {coeff: value for coeff, value in model.fit().params.items()}
 
-    return CalTRACKSegmentModel(
+    segment_model = CalTRACKSegmentModel(
         segment_name=segment_name,
         model=model,
         formula=formula,
         model_params=model_params,
         warnings=warnings,
     )
+    if model:
+        this_segment_data = segment_data[segment_data.weight == 1]
+        predicted_value = pd.Series(model.fit().predict(this_segment_data))
+        segment_model.totals_metrics = ModelMetrics(
+            this_segment_data.meter_value, predicted_value, len(model_params)
+        )
+    else:
+        segment_model.totals_metrics = None
+
+    return segment_model
 
 
 def fit_caltrack_hourly_model(
@@ -497,9 +584,14 @@ def fit_caltrack_hourly_model(
         occupied_temperature_bins,
         unoccupied_temperature_bins,
     )
-    return CalTRACKHourlyModelResults(
+
+    model_results = CalTRACKHourlyModelResults(
         status="SUCCEEDED",
         method_name="caltrack_hourly",
         warnings=all_warnings,
         model=model,
     )
+    model_results.totals_metrics = {
+        seg_model.segment_name: seg_model.totals_metrics for seg_model in segment_models
+    }
+    return model_results
